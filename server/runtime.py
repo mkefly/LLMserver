@@ -116,36 +116,54 @@ class LLMUnifiedRuntime(MLModel):
             raise
 
     async def predict(self, request):
-        assert self._adapter is not None  # for type checkers
+        assert self._adapter is not None
         text, sid, params = await decode_input(request)
         REQS.labels(model=self.name, method="predict").inc()
-        with tracer.start_as_current_span("predict", attributes={"model": self.name, "adapter": self.p.adapter, "sid": sid or ""}):
+
+        method_map = {
+            "chat": self._adapter.chat,
+            "query": self._adapter.query,
+            "retrieve": self._adapter.retrieve,
+        }
+        handler = method_map.get(self.p.engine_type)
+        if handler is None:
+            raise ValueError(f"Unknown engine_type: {self.p.engine_type}")
+
+        with tracer.start_as_current_span(
+            "predict",
+            attributes={"model": self.name, "adapter": self.p.adapter, "sid": sid or ""},
+        ):
             with LAT.labels(self.name, "predict").time():
                 async with self._timeout():
-                    if self.p.engine_type == "chat":
-                        out = await self._adapter.chat(text, session_id=sid, params=params)
-                    elif self.p.engine_type == "query":
-                        out = await self._adapter.query(text, session_id=sid, params=params)
-                    else:
-                        out = await self._adapter.retrieve(text, session_id=sid, params=params)
+                    out = await handler(text, session_id=sid, params=params)
+
         return pack_text("output_text", out, self.name)
 
     async def predict_stream(self, request) -> AsyncIterator:
+        assert self._adapter is not None
         async with self._gate.slot():
             text, sid, params = await decode_input(request)
             REQS.labels(model=self.name, method="predict_stream").inc()
-            with tracer.start_as_current_span("predict_stream", attributes={"model": self.name, "adapter": self.p.adapter, "sid": sid or ""}):
+
+            stream_map = {
+                "chat": self._adapter.stream_chat,
+                "query": self._adapter.stream_query,
+            }
+            stream_handler = stream_map.get(self.p.engine_type)
+
+            with tracer.start_as_current_span(
+                "predict_stream",
+                attributes={"model": self.name, "adapter": self.p.adapter, "sid": sid or ""},
+            ):
                 try:
                     async with self._timeout():
-                        if self.p.engine_type == "chat":
-                            agen = self._adapter.stream_chat(text, session_id=sid, params=params)
-                        elif self.p.engine_type == "query":
-                            agen = self._adapter.stream_query(text, session_id=sid, params=params)
+                        if stream_handler:
+                            async for tok in stream_handler(text, session_id=sid, params=params):
+                                TOKENS.labels(model=self.name).inc()
+                                yield pack_chunk(self.name, tok, self.p.stream_format)
                         else:
-                            yield pack_chunk(self.name, await self._adapter.retrieve(text, session_id=sid, params=params), self.p.stream_format)
-                            return
-                        async for tok in agen:
-                            TOKENS.labels(model=self.name).inc()
-                            yield pack_chunk(self.name, tok, self.p.stream_format)
+                            # default to retrieve for non-streaming engine types
+                            result = await self._adapter.retrieve(text, session_id=sid, params=params)
+                            yield pack_chunk(self.name, result, self.p.stream_format)
                 except (TimeoutError, asyncio.CancelledError):
                     yield pack_chunk(self.name, "[stream-ended]", self.p.stream_format)

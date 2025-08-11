@@ -13,7 +13,7 @@ class Params(BaseModel):
     adapter: str = "llama_index"                # e.g., "llama_index", "langchain", "crewai"
     engine_type: EngineType = "chat"
 
-    resolver: str = "uc_stage"                  # "uc_stage" | "static_uri" | custom
+    resolver: str = "uc_alias"                  # "uc_alias" | "static_uri" | custom
     model_ref: str                               # e.g., models:/cat.sch.model/Production OR runs:/... OR pkg.module:factory
 
     # common knobs
