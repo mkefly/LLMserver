@@ -15,11 +15,6 @@ from .io_utils import decode_input, pack_text, pack_chunk
 from .reliability import ConcurrencyGate
 from .registry import adapter as get_adapter, resolver as get_resolver, memory as get_memory  # noqa: F401
 
-# Ensure resolvers and adapters register themselves on import
-from .models import resolvers as _resolvers  # noqa: F401
-from .adapters import __init__ as _adapters  # noqa: F401
-from .memory import __init__ as _memory      # noqa: F401
-
 import inspect
 import logging
 
