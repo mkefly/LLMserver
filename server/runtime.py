@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio, contextlib
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
+from .capabilities import CapLLM
 try:
     from mlserver import MLModel  # prod
 except Exception:  # local tests without mlserver
@@ -23,7 +24,67 @@ from .models import resolvers as _resolvers  # noqa: F401
 from .adapters import __init__ as _adapters  # noqa: F401
 from .memory import __init__ as _memory      # noqa: F401
 
+import inspect
+import logging
+
+log = logging.getLogger(__name__)
+
+def _build_adapter(adapter_name: str, resolved_uri: str, p: Params) -> CapLLM:
+    """
+    Create an adapter instance from the registered factory, passing only
+    the kwargs it accepts. This makes adding new adapters zero-touch.
+    """
+    factory = get_adapter(adapter_name)
+
+    # Common kwargs we *may* provide to any adapter
+    candidate_kwargs = {
+        "resolved_uri": resolved_uri,      # for UC / MLflow-backed adapters
+        "model_ref": p.model_ref,          # for code-factory style adapters (e.g., LangChain)
+        "top_k": getattr(p, "top_k", None),
+        "engine_type": getattr(p, "engine_type", None),
+    }
+
+    # Optional pass-through bag (if you add Params.adapter_kwargs: dict = Field(default_factory=dict))
+    adapter_kwargs = getattr(p, "adapter_kwargs", None) or {}
+    candidate_kwargs.update(adapter_kwargs)
+
+    # Filter by the factory's accepted parameters
+    sig = inspect.signature(factory)
+    accepted = {k: v for k, v in candidate_kwargs.items()
+                if k in sig.parameters and v is not None}
+
+    # Friendly diagnostics for mismatches
+    missing_required = [
+        name for name, param in sig.parameters.items()
+        if param.default is inspect._empty and name not in accepted and param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY
+        )
+    ]
+    if missing_required:
+        log.warning(
+            "Adapter '%s' factory requires missing args %s. "
+            "Provided keys: %s. Consider supplying via Params.adapter_kwargs.",
+            adapter_name, missing_required, list(candidate_kwargs.keys()),
+        )
+
+    try:
+        adapter = factory(**accepted)
+        log.debug("Constructed adapter '%s' with args: %s", adapter_name, accepted)
+        return adapter
+    except TypeError as e:
+        raise ValueError(
+            f"Could not construct adapter '{adapter_name}'. "
+            f"Factory parameters: {list(sig.parameters.keys())}. "
+            f"Provided kwargs: {accepted}. Original error: {e}"
+        ) from e
+
+
 class LLMUnifiedRuntime(MLModel):
+    def __init__(self, *args, **kwargs):
+        # makes mypy happy if it inspects attributes created in load()
+        super().__init__(*args, **kwargs) if hasattr(super(), "__init__") else None
+        self._adapter: CapLLM | None = None
+
     async def load(self) -> bool:
         init_tracing("mlserver")
         init_prom("PROM_PORT")
@@ -35,16 +96,8 @@ class LLMUnifiedRuntime(MLModel):
         resolved = await self._resolver.resolve_initial(self.p.model_ref)
 
         # Instantiate adapter
-        if self.p.adapter == "llama_index":
-            self._adapter = get_adapter("llama_index")(resolved_uri=resolved, top_k=self.p.top_k)
-        elif self.p.adapter == "langchain":
-            # For code-factory: set resolver=static_uri and pass the factory path via model_ref
-            self._adapter = get_adapter("langchain")(factory_path=self.p.model_ref)
-        else:
-            # Third-party adapter registered elsewhere
-            self._adapter = get_adapter(self.p.adapter)(resolved_uri=resolved, top_k=self.p.top_k)
-
-        await self._adapter.load()
+        self._adapter = _build_adapter(self.p.adapter, resolved, self.p)
+        await self._adapter.load() 
 
         # Hot reload
         self._watch_task = None
@@ -72,6 +125,7 @@ class LLMUnifiedRuntime(MLModel):
             raise
 
     async def predict(self, request):
+        assert self._adapter is not None  # for type checkers
         text, sid, params = await decode_input(request)
         REQS.labels(model=self.name, method="predict").inc()
         with tracer.start_as_current_span("predict", attributes={"model": self.name, "adapter": self.p.adapter, "sid": sid or ""}):
