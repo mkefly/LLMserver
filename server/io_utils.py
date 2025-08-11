@@ -1,11 +1,29 @@
+"""I/O helpers for MLServer requests and streaming chunks."""
+from __future__ import annotations
 import json
 from typing import Any, Dict, Optional, Tuple
-from mlserver.types import InferenceRequest, InferenceResponse, ResponseOutput
-from mlserver.codecs import decode
-from mlserver.codecs.string import StringRequestCodec, StringCodec
+try:
+    from mlserver.types import InferenceRequest, InferenceResponse, ResponseOutput
+    from mlserver.codecs import decode
+    from mlserver.codecs.string import StringRequestCodec, StringCodec
+except Exception:
+    # Light stubs for local lint/tests without mlserver installed
+    class InferenceRequest: ...
+    class ResponseOutput: 
+        def __init__(self, name: str, shape, datatype: str, data): 
+            self.name, self.shape, self.datatype, self.data = name, shape, datatype, data
+    class InferenceResponse:
+        def __init__(self, model_name: str, outputs): 
+            self.model_name, self.outputs = model_name, outputs
+    def decode(req, default_codec=None): raise RuntimeError("mlserver missing")
+    class StringRequestCodec: ...
+    class StringCodec:
+        @staticmethod
+        def decode_input(obj): return obj.data.decode() if hasattr(obj, "data") else str(obj)
 
 async def decode_input(req: InferenceRequest) -> Tuple[str, Optional[str], Dict[str, Any]]:
-    if not req.inputs:
+    """Decodes input as raw text or JSON with {input, session_id, params}."""
+    if not getattr(req, "inputs", None):
         raise ValueError("No inputs provided")
     try:
         payload = await decode(req, default_codec=StringRequestCodec)
@@ -19,16 +37,17 @@ async def decode_input(req: InferenceRequest) -> Tuple[str, Optional[str], Dict[
     except Exception:
         pass
     first = req.inputs[0]
-    txt = StringCodec.decode_input(first)
+    txt = StringCodec.decode_input(first)  # type: ignore[attr-defined]
     return txt, None, {}
 
 def pack_text(name: str, text: str, model: str) -> InferenceResponse:
-    return InferenceResponse(
-        model_name=model,
-        outputs=[ResponseOutput(name=name, shape=[1], datatype="BYTES", data=[text])]
-    )
+    """Packs a single BYTES output tensor for MLServer."""
+    return InferenceResponse(model_name=model, outputs=[
+        ResponseOutput(name=name, shape=[1], datatype="BYTES", data=[text])
+    ])
 
 def pack_chunk(model: str, token: str, fmt: str) -> InferenceResponse:
+    """Packs a streaming token in text or JSONL."""
     if fmt == "jsonl":
         token = json.dumps({"type": "token", "data": token}, separators=(",", ":"))
     return pack_text("token", token, model)

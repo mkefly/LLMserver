@@ -1,0 +1,13 @@
+mlserver
+mlserver-mlflow
+mlflow
+llama-index
+langchain
+langchain-core
+langchain-openai
+prometheus-client
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+fastapi
+uvicorn
+mlserver-grpc-protos

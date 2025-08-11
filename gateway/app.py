@@ -1,9 +1,10 @@
+"""Gateway sidecar: HTTP SSE that bridges to MLServer gRPC streaming."""
+from __future__ import annotations
 import os, json, time, asyncio, grpc
 from typing import AsyncGenerator
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from mlserver_grpc_protos import inference_pb2, inference_pb2_grpc
 from prometheus_client import start_http_server, Counter, Histogram
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.grpc import GrpcAioInstrumentorClient
@@ -12,6 +13,9 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+
+# gRPC stubs are provided by mlserver_grpc_protos package
+from mlserver_grpc_protos import inference_pb2, inference_pb2_grpc
 
 GRPC_HOST = os.getenv("GATEWAY_GRPC_HOST", "mlserver")
 GRPC_PORT = int(os.getenv("GATEWAY_GRPC_PORT", "8081"))
@@ -52,21 +56,12 @@ async def stream(model: str, request: Request, input: str, session_id: str | Non
         call_params = json.loads(params) if params else {}
     except Exception as e:
         raise HTTPException(400, f"Invalid params JSON: {e}")
-
     payload = {"input": input}
     if session_id: payload["session_id"] = session_id
     if call_params: payload["params"] = call_params
 
-    # Propagate W3C traceparent header if present
-    traceparent = request.headers.get("traceparent")
-
     async def gen() -> AsyncGenerator[str, None]:
-        opts = []
-        if traceparent:
-            md = (("traceparent", traceparent),)
-            opts.append(("grpc.extra_headers", md))
-
-        async with grpc.aio.insecure_channel(f"{GRPC_HOST}:{GRPC_PORT}", options=opts) as ch:
+        async with grpc.aio.insecure_channel(f"{GRPC_HOST}:{GRPC_PORT}") as ch:
             stub = inference_pb2_grpc.GRPCInferenceServiceStub(ch)
             stream = stub.ModelStreamInfer(_req(model, payload))
             last = time.monotonic()

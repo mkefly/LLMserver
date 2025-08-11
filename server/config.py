@@ -1,42 +1,43 @@
-from pydantic import BaseModel, Field, validator
-from typing import Optional, Literal
+"""Runtime configuration with strict validation.
 
-Framework = Literal["llamaindex", "langchain"]
+This keeps misconfiguration errors out of runtime execution.
+"""
+from __future__ import annotations
+from typing import Literal, Optional
+from pydantic import BaseModel, Field, validator
+
 EngineType = Literal["chat", "query", "retriever"]
 StreamFmt = Literal["text", "jsonl"]
 
 class Params(BaseModel):
-    framework: Framework = "llamaindex"
-
-    # LlamaIndex (Unity Catalog stage URI)
-    uc_model_uri: Optional[str] = None                 # models:/catalog.schema.name/Production
+    adapter: str = "llama_index"                # e.g., "llama_index", "langchain", "crewai"
     engine_type: EngineType = "chat"
+
+    resolver: str = "uc_stage"                  # "uc_stage" | "static_uri" | custom
+    model_ref: str                               # e.g., models:/cat.sch.model/Production OR runs:/... OR pkg.module:factory
+
+    # common knobs
     top_k: int = Field(default=4, ge=1, le=100)
 
-    # LangChain
-    langchain_factory: Optional[str] = None            # "pkg.mod:build_chain"
-    use_history: bool = True
+    # memory (optional pluggable)
+    memory_backend: str = "inproc"              # "inproc" | "redis" | "uc_delta"
+    redis_url: Optional[str] = None
+    uc_delta_table: Optional[str] = None
 
-    # Runtime & streaming
+    # runtime
     timeout_s: int = Field(default=120, ge=1, le=900)
     stream_format: StreamFmt = "text"
 
-    # Hot reload (UC)
+    # hot reload (if resolver supports it)
     hot_reload: bool = True
     hot_reload_interval_s: int = Field(default=30, ge=5, le=600)
 
-    # Reliability
+    # reliability
     max_concurrent_streams: int = Field(default=64, ge=1, le=10000)
     drain_seconds: int = Field(default=10, ge=1, le=300)
 
-    @validator("uc_model_uri", always=True)
-    def _need_uc_for_llama(cls, v, values):
-        if values.get("framework") == "llamaindex" and not v:
-            raise ValueError("uc_model_uri is required for framework=llamaindex")
-        return v
-
-    @validator("langchain_factory", always=True)
-    def _need_factory_for_lc(cls, v, values):
-        if values.get("framework") == "langchain" and not v:
-            raise ValueError("langchain_factory is required for framework=langchain")
+    @validator("uc_delta_table", always=True)
+    def _need_uc_table(cls, v, values):
+        if values.get("memory_backend") == "uc_delta" and not v:
+            raise ValueError("uc_delta_table is required for memory_backend=uc_delta")
         return v
