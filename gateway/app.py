@@ -6,9 +6,9 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import start_http_server, Counter, Histogram
+from opentelemetry import trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.grpc import GrpcAioInstrumentorClient
-from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -31,6 +31,7 @@ provider = TracerProvider(resource=Resource.create({"service.name": "gateway"}))
 provider.add_span_processor(BatchSpanProcessor(
   OTLPSpanExporter(endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317"), insecure=True)
 ))
+
 trace.set_tracer_provider(provider)
 GrpcAioInstrumentorClient().instrument()
 

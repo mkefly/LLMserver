@@ -8,11 +8,7 @@ import asyncio, contextlib
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 from .capabilities import CapLLM
-try:
-    from mlserver import MLModel  # prod
-except Exception:  # local tests without mlserver
-    class MLModel: pass  # type: ignore[misc]
-
+from mlserver import MLModel
 from .config import Params
 from .observability import REQS, TOKENS, LAT, tracer, init_prom, init_tracing
 from .io_utils import decode_input, pack_text, pack_chunk

@@ -4,7 +4,7 @@ This keeps misconfiguration errors out of runtime execution.
 """
 from __future__ import annotations
 from typing import Literal, Optional
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field
 
 EngineType = Literal["chat", "query", "retriever"]
 StreamFmt = Literal["text", "jsonl"]
@@ -35,9 +35,3 @@ class Params(BaseModel):
     # reliability
     max_concurrent_streams: int = Field(default=64, ge=1, le=10000)
     drain_seconds: int = Field(default=10, ge=1, le=300)
-
-    @validator("uc_delta_table", always=True)
-    def _need_uc_table(cls, v, values):
-        if values.get("memory_backend") == "uc_delta" and not v:
-            raise ValueError("uc_delta_table is required for memory_backend=uc_delta")
-        return v

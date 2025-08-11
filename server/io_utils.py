@@ -2,24 +2,9 @@
 from __future__ import annotations
 import json
 from typing import Any, Dict, Optional, Tuple
-try:
-    from mlserver.types import InferenceRequest, InferenceResponse, ResponseOutput
-    from mlserver.codecs import decode
-    from mlserver.codecs.string import StringRequestCodec, StringCodec
-except Exception:
-    # Light stubs for local lint/tests without mlserver installed
-    class InferenceRequest: ...
-    class ResponseOutput: 
-        def __init__(self, name: str, shape, datatype: str, data): 
-            self.name, self.shape, self.datatype, self.data = name, shape, datatype, data
-    class InferenceResponse:
-        def __init__(self, model_name: str, outputs): 
-            self.model_name, self.outputs = model_name, outputs
-    def decode(req, default_codec=None): raise RuntimeError("mlserver missing")
-    class StringRequestCodec: ...
-    class StringCodec:
-        @staticmethod
-        def decode_input(obj): return obj.data.decode() if hasattr(obj, "data") else str(obj)
+from mlserver.types import InferenceRequest, InferenceResponse, ResponseOutput
+from mlserver.codecs import decode
+from mlserver.codecs.string import StringRequestCodec, StringCodec
 
 async def decode_input(req: InferenceRequest) -> Tuple[str, Optional[str], Dict[str, Any]]:
     """Decodes input as raw text or JSON with {input, session_id, params}."""
