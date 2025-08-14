@@ -332,4 +332,24 @@ class Worker(Process):
         Periodically log worker activity & queue sizes.
         Interval defaults to 10s; override with env MLSERVER_WORKER_HEARTBEAT_SEC.
         """
-        pref = se
+        pref = self._logp()
+        interval = float(os.getenv("MLSERVER_WORKER_HEARTBEAT_SEC", "10"))
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                logger.info(
+                    "%s heartbeat active=%s req_total=%d stream_reqs=%d chunks_total=%d "
+                    "qsize{req=%s,updates=%s}",
+                    pref,
+                    self._active,
+                    self._req_total,
+                    self._req_stream_total,
+                    self._chunks_total,
+                    self._safe_qsize(self._requests),
+                    self._safe_qsize(self._model_updates),
+                )
+            except asyncio.CancelledError:
+                logger.debug("%s heartbeat cancelled", pref)
+                break
+            except Exception:
+                logger.exception("%s heartbeat error", pref)
