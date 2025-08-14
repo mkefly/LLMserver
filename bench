@@ -1,335 +1,335 @@
-gotcha — here’s a **drop-in replacement** that makes the streaming benchmark run **many cases**, not just one. It matches your repo’s structure (helpers + RestClient) and stays single-server.
+import asyncio
+import select
+import signal
+import inspect
+import os
+import time
+from asyncio import Task, CancelledError
+from multiprocessing import Process, Queue
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from typing import Optional
 
----
+from mlserver.registry import MultiModelRegistry
+from mlserver.utils import install_uvloop_event_loop, schedule_with_callback
+from mlserver.logging import configure_logger
+from mlserver.settings import Settings
+from mlserver.metrics import configure_metrics
+from mlserver.context import model_context
+from mlserver.env import Environment
 
-# benchmarking/common/rest.js
+from .messages import (
+    ModelRequestMessage,
+    ModelUpdateType,
+    ModelUpdateMessage,
+    ModelResponseMessage,
+    # streaming message types
+    ModelStreamChunkMessage,
+    ModelStreamEndMessage,
+)
+from .utils import terminate_queue, END_OF_QUEUE
+from .logging import logger
+from .errors import WorkerError
 
-(add `inferStream`; keep the rest as-is)
+IGNORED_SIGNALS = [signal.SIGINT, signal.SIGTERM, signal.SIGQUIT]
 
-```js
-// benchmarking/common/rest.js
-import { check } from "k6";
-import http from "k6/http";
 
-function checkResponse(res) {
-  check(res, {
-    "is status 200": (r) => r.status === 200,
-  });
-}
+def _noop():
+    pass
 
-export class RestClient {
-  constructor() {
-    this.restHost = `http://${__ENV.MLSERVER_HOST}:${__ENV.MLSERVER_HTTP_PORT}`;
-    this.modelVersion = __ENV.MODEL_VERSION || "";
-  }
 
-  #versionsPrefix(name) {
-    return this.modelVersion
-      ? `/v2/models/${name}/versions/${encodeURIComponent(this.modelVersion)}`
-      : `/v2/models/${name}`;
-  }
+class Worker(Process):
+    def __init__(
+        self, settings: Settings, responses: Queue, env: Optional[Environment] = None
+    ):
+        super().__init__()
+        self._settings = settings
+        self._responses = responses
+        self._requests: Queue[ModelRequestMessage] = Queue()
+        self._model_updates: Queue[ModelUpdateMessage] = Queue()
+        self._env = env
 
-  loadModel(name) {
-    const res = http.post(`${this.restHost}/v2/repository/models/${name}/load`);
-    checkResponse(res);
-    return res;
-  }
+        self.__executor = None
 
-  unloadModel(name) {
-    const res = http.post(`${this.restHost}/v2/repository/models/${name}/unload`);
-    checkResponse(res);
-    return res;
-  }
+        # ── NEW: activity counters & heartbeat
+        self._req_total = 0
+        self._req_stream_total = 0
+        self._chunks_total = 0
+        self._hb_task: Optional[asyncio.Task] = None
+        self._active = False  # will flip true in __inner_init__
 
-  infer(name, payload) {
-    const headers = { "Content-Type": "application/json" };
-    const res = http.post(
-      `${this.restHost}/v2/models/${name}/infer`,
-      JSON.stringify(payload),
-      { headers }
-    );
-    checkResponse(res);
-    return res;
-  }
+    # ---------- helpers -------------------------------------------------------
 
-  // NEW: stream endpoint
-  inferStream(name, payload) {
-    const headers = {
-      "Content-Type": "application/json",
-      Accept: "application/x-ndjson, application/json, */*",
-    };
-    const url = `${this.restHost}${this.#versionsPrefix(name)}/infer_stream`;
-    const res = http.post(url, JSON.stringify(payload), { headers });
-    checkResponse(res);
-    return res;
-  }
-}
-```
+    def _logp(self) -> str:
+        """Consistent prefix for worker logs."""
+        return f"[worker name={self.name} pid={os.getpid()}]"
 
----
+    def _safe_qsize(self, q: Queue) -> Optional[int]:
+        try:
+            return q.qsize()
+        except (NotImplementedError, OSError):
+            return None
 
-# benchmarking/scenarios/inference-rest-stream.js
+    @property
+    def _executor(self):
+        # lazy threadpool (cannot be pickled pre-fork)
+        if self.__executor is None:
+            self.__executor = ThreadPoolExecutor()
+        return self.__executor
 
-(rewritten to **generate a bunch of cases** + also **use your data file**; it will iterate across **all** cases, not just one)
+    # ---------- process lifecycle --------------------------------------------
 
-```js
-// benchmarking/scenarios/inference-rest-stream.js
-import { group } from "k6";
-import { SharedArray } from "k6/data";
-import { readTestData } from "../common/helpers.js";
-import { RestClient } from "../common/rest.js";
+    def run(self):
+        ctx = self._env or nullcontext()
+        with ctx:
+            install_uvloop_event_loop()
+            configure_logger(self._settings)
+            configure_metrics(self._settings)
+            self._ignore_signals()
+            pref = self._logp()
+            try:
+                logger.info(
+                    "%s starting; parallel_workers=%s debug=%s",
+                    pref,
+                    getattr(self._settings, "parallel_workers", None),
+                    getattr(self._settings, "debug", None),
+                )
+                asyncio.run(self.coro_run())
+            finally:
+                logger.info("%s exiting run()", pref)
 
-/**
- * One server at a time.
- * Builds a LARGE case list from:
- *   1) ../data/<TEST_DATASET>/rest-requests.json  (single or array)
- *   2) OPTIONAL: generated cases (dtype/shape/mode grid)
- *
- * Env knobs:
- *   MLSERVER_HOST, MLSERVER_HTTP_PORT
- *   MODEL_NAME                (default: TEST_DATASET or "sum-model")
- *   TEST_DATASET              (folder under ../data/, default: "sum-model")
- *   PARALLEL_WORKERS          (just a tag; set to match your server config)
- *
- *   -- Generation controls (set GENERATE=1 to enable, default 1):
- *   GENERATE=1|0
- *   DATATYPES='["FP32","INT32","BYTES"]'
- *   SHAPES='[[5],[16],[2,8]]'
- *   MODES='["sequence","random","const"]'
- *   CASES_PER_COMBO=4
- *   CONST_VALUE=1
- *   BYTES_ENCODING=utf8|base64
- *   BYTES_WORD=token
- *   SEED=1337
- *
- *   Execution:
- *   VUS=8
- *   LOOPS=3                   (#times to traverse the whole case list)
- *   ITERATIONS                (override total iters; else LOOPS*cases)
- */
+    def _ignore_signals(self):
+        loop = asyncio.get_event_loop()
+        for sign in IGNORED_SIGNALS:
+            loop.add_signal_handler(sign, _noop)
 
-function jsonEnv(name, fallback) {
-  const raw = __ENV[name];
-  if (!raw) return fallback;
-  try { return JSON.parse(raw); } catch (e) { throw new Error(`Invalid JSON in ${name}: ${e.message}`); }
-}
-function numEnv(name, def) {
-  const raw = __ENV[name];
-  if (raw == null || raw === "") return def;
-  const n = Number(raw);
-  if (!Number.isFinite(n)) throw new Error(`Invalid number in ${name}: ${raw}`);
-  return n;
-}
-function strEnv(name, def) {
-  const raw = __ENV[name];
-  return (raw == null || raw === "") ? def : raw;
-}
+    def __inner_init__(self):
+        self._model_registry = MultiModelRegistry()
+        self._active = True
 
-const TEST_DATASET = strEnv("TEST_DATASET", "sum-model");
-const MODEL_NAME = strEnv("MODEL_NAME", TEST_DATASET);
+    async def coro_run(self):
+        self.__inner_init__()
+        loop = asyncio.get_event_loop()
 
-// ── generation config
-const GENERATE = strEnv("GENERATE", "1") === "1";
-const DATATYPES = jsonEnv("DATATYPES", ["FP32", "INT32", "BYTES"]).map((s) => s.toUpperCase());
-const SHAPES = jsonEnv("SHAPES", [[5], [16], [2, 8]]);
-const MODES = jsonEnv("MODES", ["sequence", "random", "const"]).map((s) => s.toLowerCase());
-const CASES_PER_COMBO = numEnv("CASES_PER_COMBO", 4);
-const CONST_VALUE = (__ENV.CONST_VALUE != null) ? __ENV.CONST_VALUE : 1;
-const BYTES_ENCODING = strEnv("BYTES_ENCODING", "utf8").toLowerCase(); // utf8|base64
-const BYTES_WORD = strEnv("BYTES_WORD", "token");
-const SEED = numEnv("SEED", 1337);
+        # ── NEW: start heartbeat
+        self._hb_task = asyncio.create_task(self._heartbeat(), name="worker-heartbeat")
 
-// ── deterministic RNG
-function lcg(seed) {
-  let s = (seed >>> 0) || 1;
-  return function rand() {
-    s = (Math.imul(1664525, s) + 1013904223) >>> 0;
-    return s / 0x100000000;
-  };
-}
-function sizeFromShape(shape) { return (shape || []).reduce((a, b) => a * b, 1) || 0; }
-function genNumeric(n, mode, dtype, rand) {
-  const out = new Array(n);
-  if (mode === "const") {
-    const v = Number(CONST_VALUE);
-    for (let i = 0; i < n; i++) out[i] = v;
-  } else if (mode === "random") {
-    for (let i = 0; i < n; i++) out[i] = dtype.startsWith("FP") ? rand() : Math.floor(rand() * 1000) - 500;
-  } else {
-    for (let i = 0; i < n; i++) out[i] = i + 1;
-  }
-  if (dtype === "INT64" || dtype === "INT32") return out.map((x) => Math.trunc(x));
-  return out.map(Number);
-}
-function asciiToBase64(s) {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  const bytes = Array.from(s, (c) => c.charCodeAt(0) & 0xff);
-  let out = "";
-  for (let i = 0; i < bytes.length; i += 3) {
-    const b1 = bytes[i], b2 = bytes[i + 1], b3 = bytes[i + 2];
-    const x1 = b1 >> 2;
-    const x2 = ((b1 & 3) << 4) | (b2 != null ? (b2 >> 4) : 0);
-    const x3 = b2 != null ? ((b2 & 15) << 2) | (b3 != null ? (b3 >> 6) : 0) : 64;
-    const x4 = b3 != null ? (b3 & 63) : 64;
-    out += alphabet[x1] + alphabet[x2] + (x3 === 64 ? "=" : alphabet[x3]) + (x4 === 64 ? "=" : alphabet[x4]);
-  }
-  return out;
-}
-function genBytes(n, mode, rand) {
-  const arr = new Array(n);
-  if (mode === "const") {
-    const s = String(CONST_VALUE);
-    for (let i = 0; i < n; i++) arr[i] = s;
-  } else if (mode === "random") {
-    for (let i = 0; i < n; i++) {
-      const suffix = Math.floor(rand() * 1e9).toString(36);
-      arr[i] = `${BYTES_WORD}_${i}_${suffix}`;
-    }
-  } else {
-    for (let i = 0; i < n; i++) arr[i] = `${BYTES_WORD}_${i + 1}`;
-  }
-  if (BYTES_ENCODING === "base64") return arr.map(asciiToBase64);
-  return arr;
-}
-function buildRequest(dtype, shape, mode, rand) {
-  const n = sizeFromShape(shape);
-  const data = (dtype === "BYTES") ? genBytes(n, mode, rand) : genNumeric(n, mode, dtype, rand);
-  return {
-    id: "k6-stream-batch",
-    inputs: [{ name: "a", shape, datatype: dtype, data }],
-    parameters: { content_type: "application/json" },
-  };
-}
+        pref = self._logp()
+        logger.debug(
+            "%s event loop started; requests_qsize=%s updates_qsize=%s",
+            pref,
+            self._safe_qsize(self._requests),
+            self._safe_qsize(self._model_updates),
+        )
 
-// ── Build all CASES up front (SharedArray) — contains BOTH file-based & generated
-const CASES = new SharedArray("stream_cases", () => {
-  const items = [];
+        while self._active:
+            readable = await loop.run_in_executor(self._executor, self._select)
+            for r in readable:
+                if r is self._requests._reader:
+                    request = self._requests.get()
+                    logger.debug(
+                        "%s got request: id=%s model=%s v=%s method=%s",
+                        pref,
+                        getattr(request, "id", None),
+                        getattr(request, "model_name", None),
+                        getattr(request, "model_version", None),
+                        getattr(request, "method_name", None),
+                    )
+                    schedule_with_callback(
+                        self._process_request(request), self._handle_response
+                    )
+                elif r is self._model_updates._reader:
+                    model_update = self._model_updates.get()
+                    if model_update is END_OF_QUEUE:
+                        logger.info("%s model_updates: end-of-queue received", pref)
+                        self._active = False
+                        break
 
-  // 1) from data/<TEST_DATASET>/rest-requests.json
-  try {
-    const td = readTestData(TEST_DATASET);
-    const fileCases = Array.isArray(td.rest) ? td.rest : [td.rest];
-    for (let i = 0; i < fileCases.length; i++) {
-      items.push({ payload: fileCases[i], tag: { source: "data", idx: String(i) } });
-    }
-  } catch (e) {
-    // no data folder or invalid JSON — silently skip
-  }
+                    logger.info(
+                        "%s model update: type=%s name=%s version=%s",
+                        pref,
+                        getattr(model_update, "update_type", None),
+                        getattr(getattr(model_update, "model_settings", None), "name", None),
+                        getattr(getattr(model_update, "model_settings", None), "version", None),
+                    )
+                    schedule_with_callback(
+                        self._process_model_update(model_update), self._handle_response
+                    )
 
-  // 2) generated cases (optional)
-  if (GENERATE) {
-    for (const dtype of DATATYPES) {
-      for (const shape of SHAPES) {
-        for (const mode of MODES) {
-          for (let i = 0; i < CASES_PER_COMBO; i++) {
-            const seed = (SEED * 131 + i * 977 + JSON.stringify(shape).length + dtype.length + mode.length) >>> 0;
-            const rand = lcg(seed);
-            const req = buildRequest(dtype, shape, mode, rand);
-            items.push({
-              payload: req,
-              tag: {
-                source: "gen",
-                dtype,
-                shape: JSON.stringify(shape),
-                mode,
-                case_id: `${dtype}-${JSON.stringify(shape)}-${mode}-${i}`,
-              },
-            });
-          }
-        }
-      }
-    }
-  }
+        # graceful shutdown
+        if self._hb_task:
+            self._hb_task.cancel()
+            with contextlib.suppress(Exception):
+                await self._hb_task
 
-  return items;
-});
+        logger.info("%s loop terminated cleanly", pref)
 
-// ── Execution plan: iterate over ALL cases (possibly multiple LOOPS)
-const VUS = numEnv("VUS", 8);
-const LOOPS = numEnv("LOOPS", 1);
-const TOTAL_CASES = CASES.length * LOOPS;
-const USER_ITER = __ENV.ITERATIONS ? numEnv("ITERATIONS", 0) : null;
+    def _select(self):
+        readable, _, _ = select.select(
+            [self._requests._reader, self._model_updates._reader], [], []
+        )
+        return readable
 
-export const options = {
-  vus: VUS,
-  iterations: USER_ITER != null ? USER_ITER : Math.max(1, TOTAL_CASES),
-  tags: {
-    scenario: "inference-rest-stream",
-    model_name: MODEL_NAME,
-    parallel_workers: __ENV.PARALLEL_WORKERS || "",
-  },
-};
+    # ---------- request & update handling -------------------------------------
 
-const rest = new RestClient();
+    async def _process_request(self, request) -> ModelResponseMessage:
+        pref = self._logp()
+        t0 = time.perf_counter()
+        try:
+            model = await self._model_registry.get_model(
+                request.model_name, request.model_version
+            )
 
-export function setup() {
-  // If you want to ensure the model is resident before the test loop starts:
-  rest.loadModel(MODEL_NAME);
-  return { total: CASES.length };
-}
+            method = getattr(model, request.method_name)
+            with model_context(model.settings):
+                result = method(*request.method_args, **request.method_kwargs)
 
-export default function (data) {
-  // Round-robin through the whole case list across LOOPS
-  const idx = __ITER % CASES.length;
-  const { payload, tag } = CASES[idx];
+                # Await plain awaitables (but not async generators)
+                if inspect.isawaitable(result) and not inspect.isasyncgen(result):
+                    result = await result
 
-  group(`stream:${MODEL_NAME}`, () => {
-    // Stream call — status checked in RestClient
-    // (Optional) pass tags down to built-in http metrics via request-level tags:
-    rest.inferStream(MODEL_NAME, payload);
+                # STREAMING PATH
+                if inspect.isasyncgen(result) or hasattr(result, "__aiter__"):
+                    self._req_total += 1
+                    self._req_stream_total += 1
+                    chunks = 0
+                    logger.debug(
+                        "%s streaming start id=%s model=%s method=%s",
+                        pref,
+                        request.id,
+                        request.model_name,
+                        request.method_name,
+                    )
+                    try:
+                        async for chunk in result:
+                            chunks += 1
+                            self._chunks_total += 1
+                            # emit chunk
+                            self._responses.put(
+                                ModelStreamChunkMessage(id=request.id, chunk=chunk)
+                            )
+                            if chunks <= 3 or (chunks % 50 == 0):
+                                # first few chunks at DEBUG; then every 50th to avoid noise
+                                logger.debug(
+                                    "%s streaming chunk id=%s count=%d", pref, request.id, chunks
+                                )
+                        # normal end
+                        self._responses.put(ModelStreamEndMessage(id=request.id))
+                        dt = (time.perf_counter() - t0) * 1000
+                        logger.info(
+                            "%s streaming end id=%s chunks=%d dur_ms=%.1f",
+                            pref,
+                            request.id,
+                            chunks,
+                            dt,
+                        )
+                    except (Exception, CancelledError) as e:
+                        logger.exception(
+                            "%s streaming error id=%s model=%s method=%s",
+                            pref,
+                            request.id,
+                            request.model_name,
+                            request.method_name,
+                        )
+                        self._responses.put(
+                            ModelStreamEndMessage(id=request.id, exception=WorkerError(e))
+                        )
+                    # Return a minimal response to complete the scheduled task.
+                    return ModelResponseMessage(id=request.id, return_value=None)
 
-    // If you want NDJSON chunk counting, you can re-issue with http.post here
-    // and parse res.body; keeping it minimal & repo-style for now.
-  });
-}
+                # UNARY PATH
+                self._req_total += 1
+                dt = (time.perf_counter() - t0) * 1000
+                logger.debug(
+                    "%s unary done id=%s model=%s method=%s dur_ms=%.1f",
+                    pref,
+                    request.id,
+                    request.model_name,
+                    request.method_name,
+                    dt,
+                )
+                return ModelResponseMessage(id=request.id, return_value=result)
 
-export function teardown() {}
-```
+        except (Exception, CancelledError) as e:
+            logger.exception(
+                "%s error calling method='%s' model='%s' id=%s",
+                pref,
+                getattr(request, "method_name", None),
+                getattr(request, "model_name", None),
+                getattr(request, "id", None),
+            )
+            worker_error = WorkerError(e)
+            return ModelResponseMessage(id=request.id, exception=worker_error)
 
----
+    def _handle_response(self, process_task: Task):
+        # Called after scheduled coroutine resolves (unary or streaming sentinel)
+        try:
+            response_message = process_task.result()
+        except Exception:
+            logger.exception("%s _handle_response: task raised", self._logp())
+            return
+        self._responses.put(response_message)
 
-## how to run (examples)
+    async def _process_model_update(
+        self, update: ModelUpdateMessage
+    ) -> ModelResponseMessage:
+        pref = self._logp()
+        try:
+            model_settings = update.model_settings
+            if update.update_type == ModelUpdateType.Load:
+                logger.info(
+                    "%s loading model name=%s version=%s",
+                    pref,
+                    model_settings.name,
+                    model_settings.version,
+                )
+                await self._model_registry.load(model_settings)
+            elif update.update_type == ModelUpdateType.Unload:
+                logger.info(
+                    "%s unloading model name=%s version=%s",
+                    pref,
+                    model_settings.name,
+                    model_settings.version,
+                )
+                await self._model_registry.unload_version(
+                    model_settings.name, model_settings.version
+                )
+            else:
+                logger.warning(
+                    "%s unknown model update type=%s", pref, update.update_type
+                )
+            return ModelResponseMessage(id=update.id)
+        except (Exception, CancelledError) as e:
+            logger.exception(
+                "%s error processing model update type=%s name=%s version=%s",
+                pref,
+                getattr(update, "update_type", None),
+                getattr(getattr(update, "model_settings", None), "name", None),
+                getattr(getattr(update, "model_settings", None), "version", None),
+            )
+            worker_error = WorkerError(e)
+            return ModelResponseMessage(id=update.id, exception=worker_error)
 
-**Use dataset + generated grid; iterate across ALL cases (default LOOPS=1):**
+    def send_request(self, request_message: ModelRequestMessage):
+        # Note: both multiprocess- and thread-safe
+        self._requests.put(request_message)
 
-```bash
-k6 run \
-  -e MLSERVER_HOST=0.0.0.0 \
-  -e MLSERVER_HTTP_PORT=8080 \
-  -e MODEL_NAME=sum-model \
-  -e TEST_DATASET=sum-model \
-  -e PARALLEL_WORKERS=2 \
-  benchmarking/scenarios/inference-rest-stream.js
-```
+    def send_update(self, model_update: ModelUpdateMessage):
+        self._model_updates.put(model_update)
 
-**Bigger generated matrix (in addition to your data file), loop over it 3 times:**
+    async def stop(self):
+        # graceful shutdown
+        self._active = False
+        await terminate_queue(self._model_updates)
+        self._model_updates.close()
+        self._requests.close()
+        self._executor.shutdown()
 
-```bash
-DATATYPES='["FP32","INT32","BYTES"]' \
-SHAPES='[[5],[16],[2,8]]' \
-MODES='["sequence","random","const"]' \
-CASES_PER_COMBO=5 \
-LOOPS=3 \
-VUS=16 \
-k6 run \
-  -e MLSERVER_HOST=0.0.0.0 \
-  -e MLSERVER_HTTP_PORT=8080 \
-  -e MODEL_NAME=sum-model \
-  -e TEST_DATASET=sum-model \
-  -e PARALLEL_WORKERS=4 \
-  benchmarking/scenarios/inference-rest-stream.js
-```
+    # ---------- NEW: heartbeat -------------------------------------------------
 
-**Only use your data file (disable generator):**
-
-```bash
-GENERATE=0 \
-k6 run \
-  -e MLSERVER_HOST=0.0.0.0 \
-  -e MLSERVER_HTTP_PORT=8080 \
-  -e MODEL_NAME=sum-model \
-  -e TEST_DATASET=sum-model \
-  benchmarking/scenarios/inference-rest-stream.js
-```
-
-This recreates the benchmark so it **runs every case** (from your dataset and/or a generated grid) rather than just one.
+    async def _heartbeat(self):
+        """
+        Periodically log worker activity & queue sizes.
+        Interval defaults to 10s; override with env MLSERVER_WORKER_HEARTBEAT_SEC.
+        """
+        pref = se
