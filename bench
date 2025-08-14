@@ -399,3 +399,74 @@ class SumModel(MLModel):
 4. Repeat for 3 and 4.
 
 This preserves your “**only one server at a time**” requirement and keeps the code aligned with your repo’s structure.
+
+
+
+Here are ready-to-run `curl` examples for the streaming endpoint.
+
+### 1) Load the model (optional, but handy)
+
+```bash
+HOST=0.0.0.0
+PORT=8080
+MODEL=sum-model
+
+curl -sS -X POST "http://$HOST:$PORT/v2/repository/models/$MODEL/load"
+```
+
+### 2) Stream inference (versioned endpoint)
+
+```bash
+HOST=0.0.0.0
+PORT=8080
+MODEL=sum-model
+VERSION=v1.0.0
+
+curl -N -sS \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/x-ndjson" \
+  -d '{
+    "id": "curl-stream",
+    "inputs": [{
+      "name": "a",
+      "shape": [5],
+      "datatype": "FP32",
+      "data": [1, 2, 3, 4, 5]
+    }],
+    "parameters": { "content_type": "application/json" }
+  }' \
+  "http://$HOST:$PORT/v2/models/$MODEL/versions/$VERSION/infer_stream"
+```
+
+### 3) Stream inference (no version in path)
+
+```bash
+HOST=0.0.0.0
+PORT=8080
+MODEL=sum-model
+
+curl -N -sS \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/x-ndjson" \
+  -d '{
+    "id": "curl-stream",
+    "inputs": [{
+      "name": "a",
+      "shape": [5],
+      "datatype": "FP32",
+      "data": [1, 2, 3, 4, 5]
+    }],
+    "parameters": { "content_type": "application/json" }
+  }' \
+  "http://$HOST:$PORT/v2/models/$MODEL/infer_stream"
+```
+
+### (Nice-to-have) Pretty-print each streamed JSON line
+
+```bash
+# Requires jq; also strips optional "data: " prefix if server uses SSE framing
+curl -N -sS -H "Content-Type: application/json" -H "Accept: application/x-ndjson" \
+  -d '{"id":"curl-stream","inputs":[{"name":"a","shape":[5],"datatype":"FP32","data":[1,2,3,4,5]}],"parameters":{"content_type":"application/json"}}' \
+  "http://$HOST:$PORT/v2/models/$MODEL/infer_stream" \
+| sed 's/^data: //' | jq -rc .
+```
