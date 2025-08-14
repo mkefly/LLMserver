@@ -1,0 +1,328 @@
+got it — here’s a **k6 script** that first **generates a bunch of request cases** (covering multiple datatypes, shapes, and generator modes), then **benchmarks** your streaming endpoint against *all* those cases. It mirrors the style of `benchmarking/generator.py` (builds `inputs[].data` from shape/datatype) and tags each request so you can slice results per-case in k6.
+
+Drop this in as:
+
+### `benchmarking/k6/inference-rest-stream-suite-k6.js`
+
+```js
+import http from "k6/http";
+import { Trend, Counter } from "k6/metrics";
+import { check } from "k6";
+import { SharedArray } from "k6/data";
+import { execution } from "k6/execution";
+
+/**
+ * ──────────────────────────────────────────────────────────────────────────────
+ * ENV CONFIG — generate many cases, then test them
+ * ──────────────────────────────────────────────────────────────────────────────
+ *
+ * BASE_URL          default http://localhost:8080
+ * MODEL_NAME        default sum-model
+ * MODEL_VERSION     default v1.0.0
+ *
+ * DATATYPES         JSON array of dtypes: ["FP32","INT32","INT64","FP64","BYTES"]
+ *                   default ["FP32","INT32","BYTES"]
+ *
+ * SHAPES            JSON array of shapes: [[5],[32],[2,8]]
+ *                   default [[5],[32]]
+ *
+ * MODES             JSON array of generators: ["sequence","random","const"]
+ *                   default ["sequence","random"]
+ *
+ * CASES_PER_COMBO   integer, how many cases to generate for each (dtype,shape,mode)
+ *                   default 3 (const will also use CONST_VALUE)
+ *
+ * CONST_VALUE       value to use when mode=="const" (number or string for BYTES)
+ *                   default 1
+ *
+ * BYTES_ENCODING    "utf8" | "base64"  (applies when dtype=="BYTES")
+ *                   default "utf8"
+ * BYTES_WORD        base token for BYTES generation (sequence/random)
+ *                   default "token"
+ *
+ * REQUEST_PARAMETERS JSON for request.parameters (default {"content_type":"application/json"})
+ * EXTRA_HEADERS      JSON with extra HTTP headers
+ *
+ * SEED              integer for deterministic "random" mode across all VUs
+ *
+ * K6 load knobs (or override via CLI):
+ *   VUS             default 16
+ *   ITERATIONS      default (generated_cases_count)  — if omitted, we set it for you
+ *
+ * This script:
+ *   1) builds a SharedArray of CASES at init time (fast & shared across VUs)
+ *   2) on each iteration picks the next case (round-robin globally)
+ *   3) POSTs to /infer_stream
+ *   4) records metrics & tags by case {dtype,shape,mode,case_id}
+ */
+
+// ── parse helpers ─────────────────────────────────────────────────────────────
+function jsonEnv(name, fallback) {
+  const raw = __ENV[name];
+  if (!raw) return fallback;
+  try { return JSON.parse(raw); }
+  catch (e) { throw new Error(`Invalid JSON in ${name}: ${e.message}`); }
+}
+function numEnv(name, fallback) {
+  const raw = __ENV[name];
+  if (raw == null || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) throw new Error(`Invalid number in ${name}: ${raw}`);
+  return n;
+}
+function strEnv(name, fallback) {
+  const raw = __ENV[name];
+  return (raw == null || raw === "") ? fallback : raw;
+}
+
+// ── endpoint config ───────────────────────────────────────────────────────────
+const BASE_URL       = strEnv("BASE_URL", "http://localhost:8080");
+const MODEL_NAME     = strEnv("MODEL_NAME", "sum-model");
+const MODEL_VERSION  = strEnv("MODEL_VERSION", "v1.0.0");
+
+// ── generator config ──────────────────────────────────────────────────────────
+const DATATYPES      = jsonEnv("DATATYPES", ["FP32", "INT32", "BYTES"]).map(s => s.toUpperCase());
+const SHAPES         = jsonEnv("SHAPES", [[5], [32]]);
+const MODES          = jsonEnv("MODES", ["sequence", "random"]).map(s => s.toLowerCase());
+const CASES_PER_COMBO= numEnv("CASES_PER_COMBO", 3);
+
+const CONST_VALUE    = (__ENV.CONST_VALUE != null) ? __ENV.CONST_VALUE : 1;
+const BYTES_ENCODING = strEnv("BYTES_ENCODING", "utf8").toLowerCase();   // utf8|base64
+const BYTES_WORD     = strEnv("BYTES_WORD", "token");
+const REQUEST_PARAMETERS = jsonEnv("REQUEST_PARAMETERS", { content_type: "application/json" });
+const EXTRA_HEADERS  = jsonEnv("EXTRA_HEADERS", {});
+
+const SEED           = numEnv("SEED", 1337);
+
+// ── load options (iterations may be inferred from generated cases) ────────────
+const DEFAULT_VUS        = numEnv("VUS", 16);
+const USER_ITERATIONS    = __ENV.ITERATIONS ? numEnv("ITERATIONS", 0) : null;
+
+// ── metrics ───────────────────────────────────────────────────────────────────
+const mLatency   = new Trend("stream_latency");      // total duration
+const mTTFB      = new Trend("stream_ttfb");         // time to first byte
+const mRecv      = new Trend("stream_receiving");    // time to receive body
+const mBytes     = new Counter("stream_bytes");
+const mChunks    = new Trend("stream_chunks");       // NDJSON/SSE lines per response
+const m2xx       = new Counter("stream_status_2xx");
+const mErrors    = new Counter("stream_errors");
+
+// ── deterministic RNG (LCG) so "random" is repeatable across VUs ─────────────
+function lcg(seed) {
+  let s = (seed >>> 0) || 1;
+  return function rand() {
+    s = (Math.imul(1664525, s) + 1013904223) >>> 0;
+    return s / 0x100000000;
+  };
+}
+const globalRand = lcg(SEED);
+
+// ── data gen helpers (mirrors spirit of benchmarking/generator.py) ────────────
+function sizeFromShape(shape) {
+  return (shape || []).reduce((a, b) => a * b, 1) || 0;
+}
+
+function genNumeric(len, mode, dtype, rand) {
+  const out = new Array(len);
+  if (mode === "const") {
+    const v = Number(CONST_VALUE);
+    for (let i = 0; i < len; i++) out[i] = v;
+  } else if (mode === "random") {
+    for (let i = 0; i < len; i++) {
+      if (dtype.startsWith("FP")) out[i] = rand();
+      else out[i] = Math.floor(rand() * 1000) - 500;
+    }
+  } else {
+    for (let i = 0; i < len; i++) out[i] = i + 1;
+  }
+  if (dtype === "INT64" || dtype === "INT32") return out.map((x) => Math.trunc(x));
+  return out.map(Number);
+}
+
+function asciiToBase64(s) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const bytes = Array.from(s, (c) => c.charCodeAt(0) & 0xff);
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b1 = bytes[i], b2 = bytes[i + 1], b3 = bytes[i + 2];
+    const x1 = b1 >> 2;
+    const x2 = ((b1 & 3) << 4) | (b2 != null ? (b2 >> 4) : 0);
+    const x3 = b2 != null ? ((b2 & 15) << 2) | (b3 != null ? (b3 >> 6) : 0) : 64;
+    const x4 = b3 != null ? (b3 & 63) : 64;
+    out += alphabet[x1] + alphabet[x2] + (x3 === 64 ? "=" : alphabet[x3]) + (x4 === 64 ? "=" : alphabet[x4]);
+  }
+  return out;
+}
+
+function genBytes(len, mode, rand) {
+  const arr = new Array(len);
+  if (mode === "const") {
+    const s = String(CONST_VALUE);
+    for (let i = 0; i < len; i++) arr[i] = s;
+  } else if (mode === "random") {
+    for (let i = 0; i < len; i++) {
+      const suffix = Math.floor(rand() * 1e9).toString(36);
+      arr[i] = `${BYTES_WORD}_${i}_${suffix}`;
+    }
+  } else {
+    for (let i = 0; i < len; i++) arr[i] = `${BYTES_WORD}_${i + 1}`;
+  }
+  if (BYTES_ENCODING === "base64") {
+    return arr.map(asciiToBase64);
+  }
+  return arr;
+}
+
+function buildInput(dtype, shape, mode, rand) {
+  const n = sizeFromShape(shape);
+  const data = (dtype === "BYTES")
+    ? genBytes(n, mode, rand)
+    : genNumeric(n, mode, dtype, rand);
+
+  return {
+    name: "a",
+    shape,
+    datatype: dtype,
+    data,
+  };
+}
+
+// Constructs a full InferenceRequest (same as non-stream infer)
+function buildRequest(dtype, shape, mode, rand) {
+  return {
+    id: "k6-stream-suite",
+    inputs: [buildInput(dtype, shape, mode, rand)],
+    parameters: REQUEST_PARAMETERS,
+  };
+}
+
+// ── Build the full CASE LIST (SharedArray) at init time ───────────────────────
+const CASES = new SharedArray("stream_cases", () => {
+  const items = [];
+  for (const dtype of DATATYPES) {
+    for (const shape of SHAPES) {
+      for (const mode of MODES) {
+        for (let i = 0; i < CASES_PER_COMBO; i++) {
+          // use a stable per-case RNG seed (so each case’s random data is fixed)
+          const caseSeed = (SEED * 131 + i * 977 + JSON.stringify(shape).length + dtype.length + mode.length) >>> 0;
+          const rand = lcg(caseSeed);
+          const req = buildRequest(dtype, shape, mode, rand);
+          const payload = JSON.stringify(req);
+          const tags = {
+            dtype,
+            shape: JSON.stringify(shape),
+            mode,
+            case_id: `${dtype}-${JSON.stringify(shape)}-${mode}-${i}`,
+          };
+          items.push({ payload, tags });
+        }
+      }
+    }
+  }
+  return items;
+});
+
+// Export k6 options *after* CASES, so we can default ITERATIONS = cases count
+export const options = {
+  vus: DEFAULT_VUS,
+  iterations: USER_ITERATIONS != null ? USER_ITERATIONS : CASES.length,
+  thresholds: {
+    "stream_latency{mode:sequence}": ["p(95)<2000"],   // tweak to your SLOs
+    "stream_ttfb":                   ["p(95)<700"],
+    "stream_status_2xx":             ["count>0"],
+  },
+};
+
+// ── URL builder ───────────────────────────────────────────────────────────────
+function streamUrl() {
+  const base = BASE_URL.replace(/\/$/, "");
+  return `${base}/v2/models/${encodeURIComponent(MODEL_NAME)}/versions/${encodeURIComponent(MODEL_VERSION)}/infer_stream`;
+}
+
+// ── Test iteration: pick case → POST → record metrics with case tags ─────────
+export default function () {
+  // global iteration index across the whole test
+  const it = execution.scenario.iterationInTest;
+  const idx = it % CASES.length;
+  const { payload, tags } = CASES[idx];
+
+  const res = http.post(streamUrl(), payload, {
+    headers: {
+      "content-type": "application/json",
+      accept: "application/x-ndjson, application/json, */*",
+      ...EXTRA_HEADERS,
+    },
+    tags,   // propagate per-case tags into built-in http_* metrics too
+  });
+
+  // metrics (also tagged)
+  mLatency.add(res.timings.duration, tags);
+  mTTFB.add(res.timings.waiting, tags);
+  mRecv.add(res.timings.receiving, tags);
+
+  const ok = check(res, { "status is 2xx": (r) => r.status >= 200 && r.status < 300 }, tags);
+  if (ok) m2xx.add(1, tags); else mErrors.add(1, tags);
+
+  const body = res.body || "";
+  mBytes.add(body.length, tags);
+
+  // Count NDJSON/SSE lines as "chunks"
+  const lines = body.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  mChunks.add(lines.length, tags);
+
+  // Lightweight validation on the last line (if JSON)
+  if (lines.length) {
+    const last = lines[lines.length - 1].replace(/^data:\s*/, "");
+    try {
+      const obj = JSON.parse(last);
+      if (!obj || !Array.isArray(obj.outputs)) mErrors.add(1, tags);
+    } catch (_) {
+      // ignore parse errors on keepalives
+    }
+  }
+}
+```
+
+---
+
+## how to run
+
+Generate a rich case matrix and let the suite iterate through all of them:
+
+```bash
+# default: DATATYPES=["FP32","INT32","BYTES"], SHAPES=[[5],[32]], MODES=["sequence","random"], CASES_PER_COMBO=3
+k6 run benchmarking/k6/inference-rest-stream-suite-k6.js
+```
+
+More cases (bigger matrix):
+
+```bash
+DATATYPES='["FP32","FP64","INT32","INT64","BYTES"]' \
+SHAPES='[[5],[16],[2,8]]' \
+MODES='["sequence","random","const"]' \
+CASES_PER_COMBO=5 \
+CONST_VALUE=7 \
+BYTES_ENCODING=base64 \
+BYTES_WORD="hello" \
+SEED=42 \
+VUS=24 \
+k6 run benchmarking/k6/inference-rest-stream-suite-k6.js
+```
+
+Per-request tags (`dtype`, `shape`, `mode`, `case_id`) flow into:
+
+* built-in `http_req_duration` / `http_req_waiting` / `http_req_receiving` (thanks to `options.tags`)
+* custom `stream_*` metrics (we add tags on `.add()`)
+
+This means you can filter/summarize by any case dimension in k6’s end-of-test summary or external outputs (InfluxDB, Prometheus RW, etc.).
+
+---
+
+## why this fits your ask
+
+* **“generate a bunch of cases then test them”** → we prebuild a **SharedArray** corpus of cases (combinatorics: `DATATYPES × SHAPES × MODES × CASES_PER_COMBO`) with deterministic data (seeded LCG).
+* **“use like the infer one use data”** → the generator builds `inputs[].data` from `shape` & `datatype` in the same spirit as your non-stream path and `benchmarking/generator.py`.
+* **streaming endpoint** → every request goes to `POST /v2/models/{name}/versions/{version}/infer_stream`, and we parse NDJSON-ish responses to count “chunks”.
+* **granular analysis** → case-specific **tags** on every metric, so you can slice results per dtype/shape/mode/case.
+
+If you want, I can also add a **CSV summary writer** (k6 supports `text-summary` extensions) or a secondary scenario that hits the non-stream endpoint to compare stream vs. non-stream per case.
