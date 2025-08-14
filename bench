@@ -1,15 +1,10 @@
-perfect — here’s a **single-server** streaming setup that matches your repo’s k6 layout and style. It includes:
-
-1. a minimal change to `benchmarking/common/rest.js` (adds `inferStream`)
-2. a simple streaming scenario that **uses your test data files** (`inference-rest-stream.js`)
-3. a “suite” streaming scenario that **generates a bunch of cases** in-memory and tests them (`inference-rest-stream-suite.js`) — still one server at a time
-4. the streaming test model (`infer_stream`) added to your `sum-model`
-
-No multi-server logic, no pretty prints. You run the same script multiple times, changing your server’s `parallel_workers` between runs.
+gotcha — here’s a **drop-in replacement** that makes the streaming benchmark run **many cases**, not just one. It matches your repo’s structure (helpers + RestClient) and stays single-server.
 
 ---
 
-# 1) `benchmarking/common/rest.js` — add streaming method
+# benchmarking/common/rest.js
+
+(add `inferStream`; keep the rest as-is)
 
 ```js
 // benchmarking/common/rest.js
@@ -25,16 +20,13 @@ function checkResponse(res) {
 export class RestClient {
   constructor() {
     this.restHost = `http://${__ENV.MLSERVER_HOST}:${__ENV.MLSERVER_HTTP_PORT}`;
-    this.modelVersion = __ENV.MODEL_VERSION || ""; // optional, to support versions in path
+    this.modelVersion = __ENV.MODEL_VERSION || "";
   }
 
-  #streamUrl(name) {
-    if (this.modelVersion) {
-      return `${this.restHost}/v2/models/${name}/versions/${encodeURIComponent(
-        this.modelVersion
-      )}/infer_stream`;
-    }
-    return `${this.restHost}/v2/models/${name}/infer_stream`;
+  #versionsPrefix(name) {
+    return this.modelVersion
+      ? `/v2/models/${name}/versions/${encodeURIComponent(this.modelVersion)}`
+      : `/v2/models/${name}`;
   }
 
   loadModel(name) {
@@ -60,13 +52,14 @@ export class RestClient {
     return res;
   }
 
-  // NEW: streaming endpoint
+  // NEW: stream endpoint
   inferStream(name, payload) {
     const headers = {
       "Content-Type": "application/json",
       Accept: "application/x-ndjson, application/json, */*",
     };
-    const res = http.post(this.#streamUrl(name), JSON.stringify(payload), { headers });
+    const url = `${this.restHost}${this.#versionsPrefix(name)}/infer_stream`;
+    const res = http.post(url, JSON.stringify(payload), { headers });
     checkResponse(res);
     return res;
   }
@@ -75,128 +68,78 @@ export class RestClient {
 
 ---
 
-# 2) `benchmarking/scenarios/inference-rest-stream.js` — use repo test data
+# benchmarking/scenarios/inference-rest-stream.js
 
-Reads your `../data/<name>/rest-requests.json` (same as the non-stream), loads the model once per iteration, then calls the **streaming** endpoint. Single server, driven by `MLSERVER_HOST` / `MLSERVER_HTTP_PORT`.
+(rewritten to **generate a bunch of cases** + also **use your data file**; it will iterate across **all** cases, not just one)
 
 ```js
 // benchmarking/scenarios/inference-rest-stream.js
 import { group } from "k6";
+import { SharedArray } from "k6/data";
 import { readTestData } from "../common/helpers.js";
 import { RestClient } from "../common/rest.js";
 
-const DATASET = __ENV.TEST_DATASET || "sum-model"; // folder name under ../data/
-const MODEL_NAME = __ENV.MODEL_NAME || DATASET;
+/**
+ * One server at a time.
+ * Builds a LARGE case list from:
+ *   1) ../data/<TEST_DATASET>/rest-requests.json  (single or array)
+ *   2) OPTIONAL: generated cases (dtype/shape/mode grid)
+ *
+ * Env knobs:
+ *   MLSERVER_HOST, MLSERVER_HTTP_PORT
+ *   MODEL_NAME                (default: TEST_DATASET or "sum-model")
+ *   TEST_DATASET              (folder under ../data/, default: "sum-model")
+ *   PARALLEL_WORKERS          (just a tag; set to match your server config)
+ *
+ *   -- Generation controls (set GENERATE=1 to enable, default 1):
+ *   GENERATE=1|0
+ *   DATATYPES='["FP32","INT32","BYTES"]'
+ *   SHAPES='[[5],[16],[2,8]]'
+ *   MODES='["sequence","random","const"]'
+ *   CASES_PER_COMBO=4
+ *   CONST_VALUE=1
+ *   BYTES_ENCODING=utf8|base64
+ *   BYTES_WORD=token
+ *   SEED=1337
+ *
+ *   Execution:
+ *   VUS=8
+ *   LOOPS=3                   (#times to traverse the whole case list)
+ *   ITERATIONS                (override total iters; else LOOPS*cases)
+ */
 
-const rest = new RestClient();
-
-export const options = {
-  vus: Number(__ENV.VUS || 1),
-  iterations: Number(__ENV.ITERATIONS || 1),
-  tags: {
-    scenario: "inference-rest-stream",
-    model_name: MODEL_NAME,
-    // Use this tag to label runs; set PARALLEL_WORKERS in your env to match server config
-    parallel_workers: __ENV.PARALLEL_WORKERS || "",
-  },
-};
-
-export function setup() {
-  const td = readTestData(DATASET);
-  const cases = Array.isArray(td.rest) ? td.rest : [td.rest];
-  return { cases };
-}
-
-export default function (data) {
-  group(`stream:${MODEL_NAME}`, () => {
-    const i = __ITER % data.cases.length;
-    const payload = data.cases[i];
-
-    // Ensure model is loaded (idempotent if already loaded)
-    rest.loadModel(MODEL_NAME);
-
-    // Stream call (k6 collects timings; status checked in RestClient)
-    const res = rest.inferStream(MODEL_NAME, payload);
-
-    // Optional: count NDJSON chunks if you want a custom metric
-    // const chunks = (res.body || "").split(/\r?\n/).map(s => s.trim()).filter(Boolean).length;
-  });
-}
-
-export function teardown() {}
-```
-
-**Run (one server at a time):**
-
-```bash
-# start a single MLServer with your desired settings.json (set parallel_workers there)
-k6 run \
-  -e MLSERVER_HOST=0.0.0.0 \
-  -e MLSERVER_HTTP_PORT=8080 \
-  -e MODEL_NAME=sum-model \
-  -e TEST_DATASET=sum-model \
-  -e PARALLEL_WORKERS=0 \  # just a tag for results; change it when you change server settings
-  benchmarking/scenarios/inference-rest-stream.js
-```
-
-Re-run after you restart the server with different `parallel_workers` (e.g. 2, then 3, then 4), updating `-e PARALLEL_WORKERS=<value>` so results are tagged accordingly. **Still one server at a time.**
-
----
-
-# 3) `benchmarking/scenarios/inference-rest-stream-suite.js` — generate many cases, then test them (single server)
-
-This stays within your repo’s style (uses `RestClient`), but **generates** request cases in memory so you can blast the stream endpoint with a wide grid of shapes/dtypes/modes — without touching `generator.py` or the data files.
-
-```js
-// benchmarking/scenarios/inference-rest-stream-suite.js
-import { group } from "k6";
-import { SharedArray } from "k6/data";
-import { RestClient } from "../common/rest.js";
-
-// ── Single server config
-const MODEL_NAME = __ENV.MODEL_NAME || "sum-model";
-
-const rest = new RestClient();
-
-// ── Case generation config (env-driven)
 function jsonEnv(name, fallback) {
   const raw = __ENV[name];
   if (!raw) return fallback;
   try { return JSON.parse(raw); } catch (e) { throw new Error(`Invalid JSON in ${name}: ${e.message}`); }
 }
 function numEnv(name, def) {
-  const raw = __ENV[name]; if (raw == null || raw === "") return def;
-  const n = Number(raw); if (!Number.isFinite(n)) throw new Error(`Invalid number in ${name}: ${raw}`); return n;
+  const raw = __ENV[name];
+  if (raw == null || raw === "") return def;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) throw new Error(`Invalid number in ${name}: ${raw}`);
+  return n;
 }
 function strEnv(name, def) {
-  const raw = __ENV[name]; return (raw == null || raw === "") ? def : raw;
+  const raw = __ENV[name];
+  return (raw == null || raw === "") ? def : raw;
 }
 
-const DATATYPES = jsonEnv("DATATYPES", ["FP32", "INT32", "BYTES"]).map(s => s.toUpperCase());
-const SHAPES = jsonEnv("SHAPES", [[5], [32]]);
-const MODES = jsonEnv("MODES", ["sequence", "random"]).map(s => s.toLowerCase());
-const CASES_PER_COMBO = numEnv("CASES_PER_COMBO", 3);
+const TEST_DATASET = strEnv("TEST_DATASET", "sum-model");
+const MODEL_NAME = strEnv("MODEL_NAME", TEST_DATASET);
 
+// ── generation config
+const GENERATE = strEnv("GENERATE", "1") === "1";
+const DATATYPES = jsonEnv("DATATYPES", ["FP32", "INT32", "BYTES"]).map((s) => s.toUpperCase());
+const SHAPES = jsonEnv("SHAPES", [[5], [16], [2, 8]]);
+const MODES = jsonEnv("MODES", ["sequence", "random", "const"]).map((s) => s.toLowerCase());
+const CASES_PER_COMBO = numEnv("CASES_PER_COMBO", 4);
 const CONST_VALUE = (__ENV.CONST_VALUE != null) ? __ENV.CONST_VALUE : 1;
 const BYTES_ENCODING = strEnv("BYTES_ENCODING", "utf8").toLowerCase(); // utf8|base64
 const BYTES_WORD = strEnv("BYTES_WORD", "token");
 const SEED = numEnv("SEED", 1337);
 
-// k6 execution
-const VUS = numEnv("VUS", 8);
-const USER_ITER = __ENV.ITERATIONS ? numEnv("ITERATIONS", 0) : null;
-
-export const options = {
-  vus: VUS,
-  iterations: USER_ITER != null ? USER_ITER : undefined, // set after CASES
-  tags: {
-    scenario: "inference-rest-stream-suite",
-    model_name: MODEL_NAME,
-    parallel_workers: __ENV.PARALLEL_WORKERS || "",
-  },
-};
-
-// deterministic RNG
+// ── deterministic RNG
 function lcg(seed) {
   let s = (seed >>> 0) || 1;
   return function rand() {
@@ -205,7 +148,6 @@ function lcg(seed) {
   };
 }
 function sizeFromShape(shape) { return (shape || []).reduce((a, b) => a * b, 1) || 0; }
-
 function genNumeric(n, mode, dtype, rand) {
   const out = new Array(n);
   if (mode === "const") {
@@ -249,224 +191,145 @@ function genBytes(n, mode, rand) {
   if (BYTES_ENCODING === "base64") return arr.map(asciiToBase64);
   return arr;
 }
-
 function buildRequest(dtype, shape, mode, rand) {
   const n = sizeFromShape(shape);
   const data = (dtype === "BYTES") ? genBytes(n, mode, rand) : genNumeric(n, mode, dtype, rand);
   return {
-    id: "k6-stream-suite",
+    id: "k6-stream-batch",
     inputs: [{ name: "a", shape, datatype: dtype, data }],
     parameters: { content_type: "application/json" },
   };
 }
 
-// Build all cases once
-const CASES = new SharedArray("stream_suite_cases", () => {
+// ── Build all CASES up front (SharedArray) — contains BOTH file-based & generated
+const CASES = new SharedArray("stream_cases", () => {
   const items = [];
-  for (const dtype of DATATYPES) {
-    for (const shape of SHAPES) {
-      for (const mode of MODES) {
-        for (let i = 0; i < CASES_PER_COMBO; i++) {
-          const seed = (SEED * 131 + i * 977 + JSON.stringify(shape).length + dtype.length + mode.length) >>> 0;
-          const rand = lcg(seed);
-          const payload = JSON.stringify(buildRequest(dtype, shape, mode, rand));
-          const tag = { dtype, shape: JSON.stringify(shape), mode, case_id: `${dtype}-${JSON.stringify(shape)}-${mode}-${i}` };
-          items.push({ payload, tag });
+
+  // 1) from data/<TEST_DATASET>/rest-requests.json
+  try {
+    const td = readTestData(TEST_DATASET);
+    const fileCases = Array.isArray(td.rest) ? td.rest : [td.rest];
+    for (let i = 0; i < fileCases.length; i++) {
+      items.push({ payload: fileCases[i], tag: { source: "data", idx: String(i) } });
+    }
+  } catch (e) {
+    // no data folder or invalid JSON — silently skip
+  }
+
+  // 2) generated cases (optional)
+  if (GENERATE) {
+    for (const dtype of DATATYPES) {
+      for (const shape of SHAPES) {
+        for (const mode of MODES) {
+          for (let i = 0; i < CASES_PER_COMBO; i++) {
+            const seed = (SEED * 131 + i * 977 + JSON.stringify(shape).length + dtype.length + mode.length) >>> 0;
+            const rand = lcg(seed);
+            const req = buildRequest(dtype, shape, mode, rand);
+            items.push({
+              payload: req,
+              tag: {
+                source: "gen",
+                dtype,
+                shape: JSON.stringify(shape),
+                mode,
+                case_id: `${dtype}-${JSON.stringify(shape)}-${mode}-${i}`,
+              },
+            });
+          }
         }
       }
     }
   }
-  // If caller didn’t pass ITERATIONS, set it to total cases
-  if (!__ENV.ITERATIONS) {
-    // k6 reads `options` only at init; we can expose a hint via env and document running with ITERATIONS unset
-    // No-op here; caller can pass --iterations or let the default be cases.length with: k6 run -e ...
-  }
+
   return items;
 });
 
-// Reflect the number of cases as default iterations if user didn’t override
-if (!__ENV.ITERATIONS) {
-  // k6 doesn't allow modifying options here; document to run with:
-  //   k6 run -e ... benchmarking/scenarios/inference-rest-stream-suite.js
-  // and it will iterate over VUs * default iterations (defaults to 1). To force exactly cases.length:
-  //   ITERATIONS=$(node -e 'console.log(<compute>))'  # or just set ITERATIONS env manually.
+// ── Execution plan: iterate over ALL cases (possibly multiple LOOPS)
+const VUS = numEnv("VUS", 8);
+const LOOPS = numEnv("LOOPS", 1);
+const TOTAL_CASES = CASES.length * LOOPS;
+const USER_ITER = __ENV.ITERATIONS ? numEnv("ITERATIONS", 0) : null;
+
+export const options = {
+  vus: VUS,
+  iterations: USER_ITER != null ? USER_ITER : Math.max(1, TOTAL_CASES),
+  tags: {
+    scenario: "inference-rest-stream",
+    model_name: MODEL_NAME,
+    parallel_workers: __ENV.PARALLEL_WORKERS || "",
+  },
+};
+
+const rest = new RestClient();
+
+export function setup() {
+  // If you want to ensure the model is resident before the test loop starts:
+  rest.loadModel(MODEL_NAME);
+  return { total: CASES.length };
 }
 
-export const setup = () => ({ total: CASES.length });
-
 export default function (data) {
-  group(`stream-suite:${MODEL_NAME}`, () => {
-    const i = __ITER % CASES.length;
-    const { payload, tag } = CASES[i];
+  // Round-robin through the whole case list across LOOPS
+  const idx = __ITER % CASES.length;
+  const { payload, tag } = CASES[idx];
 
-    // ensure model is loaded
-    rest.loadModel(MODEL_NAME);
+  group(`stream:${MODEL_NAME}`, () => {
+    // Stream call — status checked in RestClient
+    // (Optional) pass tags down to built-in http metrics via request-level tags:
+    rest.inferStream(MODEL_NAME, payload);
 
-    // streaming call with per-case tags on the HTTP request
-    rest.inferStream(MODEL_NAME, JSON.parse(payload));
-
-    // If you want per-case chunk counting, do it here by re-sending with http.post directly
-    // to access res.body; we keep repo style (use RestClient + status check).
+    // If you want NDJSON chunk counting, you can re-issue with http.post here
+    // and parse res.body; keeping it minimal & repo-style for now.
   });
 }
 
-export const teardown = () => {};
+export function teardown() {}
 ```
 
-**Run (one server at a time):**
+---
+
+## how to run (examples)
+
+**Use dataset + generated grid; iterate across ALL cases (default LOOPS=1):**
 
 ```bash
-# Example: generate a wider grid
-DATATYPES='["FP32","INT32","BYTES"]' \
-SHAPES='[[5],[16],[2,8]]' \
-MODES='["sequence","random","const"]' \
-CASES_PER_COMBO=4 \
-VUS=8 \
-# Tag the run with the server's current parallel_workers setting:
-PARALLEL_WORKERS=2 \
 k6 run \
   -e MLSERVER_HOST=0.0.0.0 \
   -e MLSERVER_HTTP_PORT=8080 \
   -e MODEL_NAME=sum-model \
-  benchmarking/scenarios/inference-rest-stream-suite.js
+  -e TEST_DATASET=sum-model \
+  -e PARALLEL_WORKERS=2 \
+  benchmarking/scenarios/inference-rest-stream.js
 ```
 
-Then restart **the same server** with a different `parallel_workers` (e.g. 3), update `PARALLEL_WORKERS=3` and run again. This keeps your **single server** rule and still lets you compare runs by the tag.
-
----
-
-# 4) `benchmarking/testserver/models/sum-model/models.py` — add streaming
-
-Adds `infer_stream` (partial sums) to your existing `predict`. Matches your simple FP32 shape `[1, 1]`.
-
-```python
-# benchmarking/testserver/models/sum-model/models.py
-from typing import AsyncIterator, Dict, List
-import asyncio
-from mlserver import types, MLModel
-
-class SumModel(MLModel):
-    async def predict(self, payload: types.InferenceRequest) -> types.InferenceResponse:
-        total = 0.0
-        for inp in payload.inputs:
-            total += sum(inp.data)
-
-        output = types.ResponseOutput(
-            name="total", shape=[1, 1], datatype="FP32", data=[total]
-        )
-        return types.InferenceResponse(model_name=self.name, id="1", outputs=[output])
-
-    # NEW: streaming endpoint
-    async def infer_stream(
-        self,
-        payload: types.InferenceRequest,
-        headers: Dict[str, str] | None = None,
-    ) -> AsyncIterator[types.InferenceResponse]:
-        values: List[float] = []
-        for inp in payload.inputs or []:
-            values.extend([float(v) for v in inp.data])
-
-        if not values:
-            yield types.InferenceResponse(
-                model_name=self.name,
-                id="stream-0",
-                outputs=[types.ResponseOutput(name="total", shape=[1, 1], datatype="FP32", data=[0.0])],
-            )
-            return
-
-        running = 0.0
-        for i, v in enumerate(values, start=1):
-            running += v
-            yield types.InferenceResponse(
-                model_name=self.name,
-                id=f"stream-{i}",
-                outputs=[types.ResponseOutput(name="total", shape=[1, 1], datatype="FP32", data=[running])],
-            )
-            await asyncio.sleep(0)
-```
-
----
-
-## How to compare `parallel_workers` (one server at a time)
-
-1. Start **one** MLServer with the desired setting, e.g.:
-
-   * `parallel_workers: 0` in `settings.json` (or via env)
-2. Run either `inference-rest-stream.js` (uses your data files) **or** `inference-rest-stream-suite.js` (generated cases).
-
-   * Pass `-e PARALLEL_WORKERS=<value>` so your results carry that tag.
-3. Stop the server, change `parallel_workers` (e.g. to 2), start it again, and **rerun the same k6 script** with `-e PARALLEL_WORKERS=2`.
-4. Repeat for 3 and 4.
-
-This preserves your “**only one server at a time**” requirement and keeps the code aligned with your repo’s structure.
-
-
-
-Here are ready-to-run `curl` examples for the streaming endpoint.
-
-### 1) Load the model (optional, but handy)
+**Bigger generated matrix (in addition to your data file), loop over it 3 times:**
 
 ```bash
-HOST=0.0.0.0
-PORT=8080
-MODEL=sum-model
-
-curl -sS -X POST "http://$HOST:$PORT/v2/repository/models/$MODEL/load"
+DATATYPES='["FP32","INT32","BYTES"]' \
+SHAPES='[[5],[16],[2,8]]' \
+MODES='["sequence","random","const"]' \
+CASES_PER_COMBO=5 \
+LOOPS=3 \
+VUS=16 \
+k6 run \
+  -e MLSERVER_HOST=0.0.0.0 \
+  -e MLSERVER_HTTP_PORT=8080 \
+  -e MODEL_NAME=sum-model \
+  -e TEST_DATASET=sum-model \
+  -e PARALLEL_WORKERS=4 \
+  benchmarking/scenarios/inference-rest-stream.js
 ```
 
-### 2) Stream inference (versioned endpoint)
+**Only use your data file (disable generator):**
 
 ```bash
-HOST=0.0.0.0
-PORT=8080
-MODEL=sum-model
-VERSION=v1.0.0
-
-curl -N -sS \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/x-ndjson" \
-  -d '{
-    "id": "curl-stream",
-    "inputs": [{
-      "name": "a",
-      "shape": [5],
-      "datatype": "FP32",
-      "data": [1, 2, 3, 4, 5]
-    }],
-    "parameters": { "content_type": "application/json" }
-  }' \
-  "http://$HOST:$PORT/v2/models/$MODEL/versions/$VERSION/infer_stream"
+GENERATE=0 \
+k6 run \
+  -e MLSERVER_HOST=0.0.0.0 \
+  -e MLSERVER_HTTP_PORT=8080 \
+  -e MODEL_NAME=sum-model \
+  -e TEST_DATASET=sum-model \
+  benchmarking/scenarios/inference-rest-stream.js
 ```
 
-### 3) Stream inference (no version in path)
-
-```bash
-HOST=0.0.0.0
-PORT=8080
-MODEL=sum-model
-
-curl -N -sS \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/x-ndjson" \
-  -d '{
-    "id": "curl-stream",
-    "inputs": [{
-      "name": "a",
-      "shape": [5],
-      "datatype": "FP32",
-      "data": [1, 2, 3, 4, 5]
-    }],
-    "parameters": { "content_type": "application/json" }
-  }' \
-  "http://$HOST:$PORT/v2/models/$MODEL/infer_stream"
-```
-
-### (Nice-to-have) Pretty-print each streamed JSON line
-
-```bash
-# Requires jq; also strips optional "data: " prefix if server uses SSE framing
-curl -N -sS -H "Content-Type: application/json" -H "Accept: application/x-ndjson" \
-  -d '{"id":"curl-stream","inputs":[{"name":"a","shape":[5],"datatype":"FP32","data":[1,2,3,4,5]}],"parameters":{"content_type":"application/json"}}' \
-  "http://$HOST:$PORT/v2/models/$MODEL/infer_stream" \
-| sed 's/^data: //' | jq -rc .
-```
+This recreates the benchmark so it **runs every case** (from your dataset and/or a generated grid) rather than just one.
